@@ -1,0 +1,41 @@
+syntax = "proto3";
+
+package kv;
+
+option go_package = "miniKV/api/proto/kvpb";
+
+service KVService {
+  rpc Put (PutRequest) returns (PutResponse);
+  rpc Get (GetRequest) returns (GetResponse);
+  rpc Delete (DeleteRequest) returns (DeleteResponse);
+}
+
+// Put 操作
+message PutRequest {
+  string key = 1;
+  string value = 2;
+  int64  timestamp = 3;  // 新增：写入时间戳（纳秒级），用于 LWW 冲突解决
+}
+message PutResponse {
+  bool success = 1;
+  string message = 2;
+}
+
+// Get 操作
+message GetRequest {
+  string key = 1;
+}
+message GetResponse {
+  bool found = 1;
+  string value = 2;
+  int64  timestamp = 3;  // 新增：数据的写入时间戳，Quorum 读比较用
+}
+
+// Delete 操作
+message DeleteRequest {
+  string key = 1;
+}
+message DeleteResponse {
+  bool success = 1;
+  string message = 2;
+}
