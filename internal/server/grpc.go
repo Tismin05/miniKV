@@ -3,7 +3,7 @@ package server
 import (
 	"context"
 
-	"miniKV/api/proto/kvpb" // 导入刚才自动生成的代码
+	"miniKV/api/proto/kvpb"
 	"miniKV/internal/storage"
 )
 
@@ -22,7 +22,7 @@ func NewGRPCServer(store *storage.KVStore) *GRPCServer {
 // 实现 .proto 中定义的 Put, Get, Delete 方法
 
 func (s *GRPCServer) Put(ctx context.Context, req *kvpb.PutRequest) (*kvpb.PutResponse, error) {
-	err := s.store.Put(req.Key, req.Value)
+	err := s.store.Put(req.Key, req.Value, req.Timestamp) // 透传 timestamp
 	if err != nil {
 		return &kvpb.PutResponse{Success: false, Message: err.Error()}, nil
 	}
@@ -30,16 +30,15 @@ func (s *GRPCServer) Put(ctx context.Context, req *kvpb.PutRequest) (*kvpb.PutRe
 }
 
 func (s *GRPCServer) Get(ctx context.Context, req *kvpb.GetRequest) (*kvpb.GetResponse, error) {
-	val, exists := s.store.Get(req.Key)
+	val, ts, exists := s.store.Get(req.Key)
 	if !exists {
-
-		return &kvpb.GetResponse{Found: false, Value: ""}, nil
+		return &kvpb.GetResponse{Found: false, Value: "", Timestamp: 0}, nil
 	}
-	return &kvpb.GetResponse{Found: true, Value: val}, nil
+	return &kvpb.GetResponse{Found: true, Value: val, Timestamp: ts}, nil // 返回 timestamp
 }
 
 func (s *GRPCServer) Delete(ctx context.Context, req *kvpb.DeleteRequest) (*kvpb.DeleteResponse, error) {
-	err := s.store.Delete(req.Key)
+	err := s.store.Delete(req.Key, 0) // Delete 使用 0 时间戳（墓碑）
 	if err != nil {
 		return &kvpb.DeleteResponse{Success: false, Message: err.Error()}, nil
 	}

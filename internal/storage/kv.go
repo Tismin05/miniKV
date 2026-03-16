@@ -13,15 +13,22 @@ import (
 	"time"
 )
 
+// ValueEntry 存储值和时间戳，用于 LWW 冲突解决
+type ValueEntry struct {
+	Value     string
+	Timestamp int64
+}
+
 type IndexRecord struct {
 	SSTFile string // 数据所在的文件名
 	Offset  int64  // 数据在文件的哪一个字节开始
 	Size    int    // 数据的长度
 }
+
 type KVStore struct {
 	mu sync.RWMutex
 
-	memTable   map[string]string
+	memTable   map[string]ValueEntry
 	memSize    int
 	maxMemSize int
 
@@ -35,11 +42,11 @@ type KVStore struct {
 
 func NewKVStore(walPath string) (*KVStore, error) {
 	kv := &KVStore{
-		memTable:      make(map[string]string),
-		maxMemSize:    100,
+		memTable:      make(map[string]ValueEntry),
+		maxMemSize:    1000,
 		index:         make(map[string]IndexRecord),
 		lastFlushTime: time.Now(),
-		maxFlushTime:  10 * time.Second,
+		maxFlushTime:  60 * time.Second,
 	}
 
 	// 扫描历史冷数据，重建内存中 Index 地图
@@ -85,6 +92,7 @@ func (kv *KVStore) loadIndexFromSSTables() {
 			line := scanner.Text() + "\n"
 			size := len(line)
 
+			// SSTable 格式: key,value,timestamp\n — 取第一个逗号前的部分作为 key
 			kvParts := strings.SplitN(strings.TrimSuffix(line, "\n"), ",", 2)
 			if len(kvParts) == 2 {
 				key := kvParts[0]
@@ -103,6 +111,7 @@ func (kv *KVStore) loadIndexFromSSTables() {
 }
 
 // 使用 WAL 恢复还未落盘的热数据
+// WAL 格式: PUT,key,value,timestamp\n
 func (kv *KVStore) loadFromWAL(walPath string) {
 	file, err := os.Open(walPath)
 	if err != nil {
@@ -114,13 +123,17 @@ func (kv *KVStore) loadFromWAL(walPath string) {
 	count := 0
 	for scanner.Scan() {
 		line := scanner.Text()
-		parts := strings.SplitN(line, ",", 3)
-		if len(parts) == 3 && parts[0] == "PUT" {
+		parts := strings.SplitN(line, ",", 4)
+		if len(parts) >= 3 && parts[0] == "PUT" {
 			key, value := parts[1], parts[2]
-			if _, exist := kv.memTable[key]; exist {
+			var ts int64 = 0
+			if len(parts) == 4 {
+				ts, _ = strconv.ParseInt(parts[3], 10, 64)
+			}
+			if _, exist := kv.memTable[key]; !exist {
 				kv.memSize++
 			}
-			kv.memTable[key] = value
+			kv.memTable[key] = ValueEntry{Value: value, Timestamp: ts}
 			count++
 		}
 	}
@@ -129,7 +142,8 @@ func (kv *KVStore) loadFromWAL(walPath string) {
 	}
 }
 
-func (kv *KVStore) Put(key, value string) error {
+// Put 写入数据，携带时间戳
+func (kv *KVStore) Put(key, value string, timestamp int64) error {
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
 
@@ -139,41 +153,43 @@ func (kv *KVStore) Put(key, value string) error {
 		}
 	}
 
-	logLine := fmt.Sprintf("PUT,%s,%s\n", key, value)
+	// WAL 格式: PUT,key,value,timestamp\n
+	logLine := fmt.Sprintf("PUT,%s,%s,%d\n", key, value, timestamp)
 	kv.walFile.WriteString(logLine)
 	kv.walFile.Sync()
 
 	if _, exist := kv.memTable[key]; !exist {
 		kv.memSize++
 	}
-	kv.memTable[key] = value
+	kv.memTable[key] = ValueEntry{Value: value, Timestamp: timestamp}
 	return nil
 }
 
 // Delete 墓碑机制减少 I/O 操作
-func (kv *KVStore) Delete(key string) error {
-	return kv.Put(key, "<TOMBSTONE>")
+func (kv *KVStore) Delete(key string, timestamp int64) error {
+	return kv.Put(key, "<TOMBSTONE>", timestamp)
 }
 
-func (kv *KVStore) Get(key string) (string, bool) {
+// Get 读取数据，返回值和时间戳
+func (kv *KVStore) Get(key string) (string, int64, bool) {
 	kv.mu.RLock()
 	defer kv.mu.RUnlock()
 
-	if val, exist := kv.memTable[key]; exist {
-		if val == "<TOMBSTONE>" {
-			return "", false
+	if entry, exist := kv.memTable[key]; exist {
+		if entry.Value == "<TOMBSTONE>" {
+			return "", 0, false
 		}
-		return val, true
+		return entry.Value, entry.Timestamp, true
 	}
 
 	record, ok := kv.index[key]
 	if !ok {
-		return "", false
+		return "", 0, false
 	}
 
 	file, err := os.Open(record.SSTFile)
 	if err != nil {
-		return "", false
+		return "", 0, false
 	}
 	defer file.Close()
 
@@ -182,15 +198,20 @@ func (kv *KVStore) Get(key string) (string, bool) {
 	file.Read(buffer)
 
 	line := string(buffer)
-	parts := strings.SplitN(strings.TrimSuffix(line, "\n"), ",", 2)
-	if len(parts) == 2 {
+	// SSTable 格式: key,value,timestamp\n
+	parts := strings.SplitN(strings.TrimSuffix(line, "\n"), ",", 3)
+	if len(parts) >= 2 {
 		value := parts[1]
-		if value == "<TOMBSTONE>" {
-			return "", false
+		var ts int64 = 0
+		if len(parts) == 3 {
+			ts, _ = strconv.ParseInt(parts[2], 10, 64)
 		}
-		return value, true
+		if value == "<TOMBSTONE>" {
+			return "", 0, false
+		}
+		return value, ts, true
 	}
-	return "", false
+	return "", 0, false
 }
 
 func (kv *KVStore) flush() error {
@@ -205,7 +226,7 @@ func (kv *KVStore) flush() error {
 	}
 	defer file.Close()
 
-	keys := make([]string, len(kv.memTable))
+	keys := make([]string, 0, len(kv.memTable))
 	for k := range kv.memTable {
 		keys = append(keys, k)
 	}
@@ -213,8 +234,9 @@ func (kv *KVStore) flush() error {
 
 	var currentOffset int64 = 0
 	for _, key := range keys {
-		v := kv.memTable[key]
-		line := fmt.Sprintf("%s,%s\n", key, v)
+		entry := kv.memTable[key]
+		// SSTable 格式: key,value,timestamp\n
+		line := fmt.Sprintf("%s,%s,%d\n", key, entry.Value, entry.Timestamp)
 		n, _ := file.WriteString(line)
 
 		kv.index[key] = IndexRecord{
@@ -226,7 +248,7 @@ func (kv *KVStore) flush() error {
 	}
 
 	kv.nextSSTId++
-	kv.memTable = make(map[string]string)
+	kv.memTable = make(map[string]ValueEntry)
 	kv.memSize = 0
 
 	kv.walFile.Truncate(0)
@@ -248,15 +270,27 @@ func (kv *KVStore) backgroundFlusher() {
 			fmt.Println("[后台巡逻] 触发时间阈值，强制生成冷数据...")
 			kv.flush()
 		}
+
+		files, _ := filepath.Glob("data_*.sst")
+		// SST 文件超过 5 个就自动合并
+		if len(files) >= 5 {
+			fmt.Println("[后台巡逻] SST 文件过多，触发自动合并...")
+			kv.compact()
+		}
+
 		kv.mu.Unlock()
 	}
 }
 
-// Compact 数据合并与垃圾回收
+// Compact 对外暴露的合并接口（加锁）
 func (kv *KVStore) Compact() error {
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
+	return kv.compact()
+}
 
+// compact 内部合并逻辑
+func (kv *KVStore) compact() error {
 	if kv.memSize > 0 {
 		if err := kv.flush(); err != nil {
 			return err
@@ -269,7 +303,11 @@ func (kv *KVStore) Compact() error {
 	}
 
 	// 用于暂存所有有效数据的临时切片
-	type kvPair struct{ key, val string }
+	type kvPair struct {
+		key string
+		val string
+		ts  int64
+	}
 	var validData []kvPair
 
 	// 顺序读取所有旧文件，过滤出有效数据
@@ -283,38 +321,42 @@ func (kv *KVStore) Compact() error {
 		// 逐行读取旧文件
 		for scanner.Scan() {
 			line := scanner.Text()
-			parts := strings.SplitN(line, ",", 2)
+			parts := strings.SplitN(line, ",", 3)
 
-			if len(parts) == 2 {
+			if len(parts) >= 2 {
 				key := parts[0]
 				val := parts[1]
+				var ts int64 = 0
+				if len(parts) == 3 {
+					ts, _ = strconv.ParseInt(parts[2], 10, 64)
+				}
 
-				// 👑 史诗级修复：抛弃脆弱的 Offset 比较，只根据“全局最新文件名”过滤！
+				// 根据"全局最新文件名"过滤！
 				record, exists := kv.index[key]
 				if exists && record.SSTFile == filename {
 					if val != "<TOMBSTONE>" {
-						validData = append(validData, kvPair{key, val})
+						validData = append(validData, kvPair{key, val, ts})
 					}
 				}
 			}
 		}
 		file.Close()
-		// 读完立刻无情删除旧文件
+		// 读完删除旧文件
 		os.Remove(filename)
 	}
 
-	// 如果没有拿到有效数据（比如全被删了），直接返回
+	// 没有拿到有效数据，直接返回
 	if len(validData) == 0 {
 		fmt.Println("[存储引擎] 垃圾回收完成！没有有效数据需要保留。")
 		return nil
 	}
 
-	// 3. 核心排序：对收集到的所有有效数据进行全局字典序排序
+	// 对收集到的所有有效数据进行全局字典序排序
 	sort.Slice(validData, func(i, j int) bool {
 		return validData[i].key < validData[j].key
 	})
 
-	// 4. 将全局排序后的数据写入一个全新的超级 SSTable
+	// 将全局排序后的数据写入一个全新的 SSTable
 	compactFileName := fmt.Sprintf("data_%d.sst", kv.nextSSTId)
 	compactFile, err := os.Create(compactFileName)
 	if err != nil {
@@ -326,7 +368,7 @@ func (kv *KVStore) Compact() error {
 	newIndex := make(map[string]IndexRecord)
 
 	for _, pair := range validData {
-		line := fmt.Sprintf("%s,%s\n", pair.key, pair.val)
+		line := fmt.Sprintf("%s,%s,%d\n", pair.key, pair.val, pair.ts)
 		n, _ := compactFile.WriteString(line)
 
 		newIndex[pair.key] = IndexRecord{
@@ -337,7 +379,7 @@ func (kv *KVStore) Compact() error {
 		currentOffset += int64(n)
 	}
 
-	// 将旧坐标本替换为全新的超级坐标本
+	// 将旧坐标本替换为全新的坐标本
 	kv.index = newIndex
 	kv.nextSSTId++
 

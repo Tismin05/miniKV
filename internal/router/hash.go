@@ -15,7 +15,7 @@ type HashRing struct {
 
 func NewHashRing(replicas int) *HashRing {
 	return &HashRing{
-		hashKeys: make([]int, replicas),
+		hashKeys: make([]int, 0, replicas),
 		hashMap:  make(map[int]string),
 		replicas: replicas,
 	}
@@ -34,24 +34,31 @@ func (r *HashRing) AddNode(nodeAddr string) {
 	slices.Sort(r.hashKeys)
 }
 
-// GetNode 根据 Key 计算出它应该去哪个节点
-func (r *HashRing) GetNode(key string) string {
+// GetNodes 根据 Key 计算出它应该去哪几个节点
+func (r *HashRing) GetNodes(key string, count int) []string {
 	if len(r.hashKeys) == 0 {
-		return ""
+		return nil
 	}
 
 	// 计算数据的哈希值
 	hash := int(crc32.ChecksumIEEE([]byte(key)))
 
 	// 二分查找顺时针寻找第一个大于等于数据哈希值的节点
-	idx := sort.Search(len(r.hashKeys), func(i int) bool {
+	index := sort.Search(len(r.hashKeys), func(i int) bool {
 		return r.hashKeys[i] >= hash
 	})
 
-	// 如果到了环的末尾，就回到开头
-	if idx == len(r.hashKeys) {
-		idx = 0
-	}
+	nodes := make([]string, 0, count)
+	seen := make(map[string]bool)
 
-	return r.hashMap[r.hashKeys[idx]] // 真正的节点地址
+	for i := 0; len(nodes) < count && i < len(r.hashKeys); i++ {
+		currIndex := (index + i) % len(r.hashKeys)
+		nodeAddr := r.hashMap[r.hashKeys[currIndex]]
+
+		if !seen[nodeAddr] {
+			nodes = append(nodes, nodeAddr)
+			seen[nodeAddr] = true
+		}
+	}
+	return nodes
 }
