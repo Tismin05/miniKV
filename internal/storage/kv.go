@@ -1,11 +1,12 @@
 package storage
 
 import (
-	"bufio"
+	"encoding/binary"
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
-	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -13,20 +14,49 @@ import (
 	"time"
 )
 
-// ValueEntry 存储值和时间戳，用于 LWW 冲突解决
+const (
+	fileHeaderSize   = 8
+	recordHeaderSize = 17
+	maxRecordBytes   = uint64(^uint32(0))
+
+	opPut    byte = 1
+	opDelete byte = 2
+)
+
+var (
+	walMagic = [fileHeaderSize]byte{'M', 'K', 'V', 'W', 'A', 'L', 1, 0}
+	sstMagic = [fileHeaderSize]byte{'M', 'K', 'V', 'S', 'S', 'T', 1, 0}
+)
+
+// ValueEntry stores a value and its timestamp for LWW conflict resolution.
 type ValueEntry struct {
 	Value     string
 	Timestamp int64
+	Deleted   bool
 }
 
 type IndexRecord struct {
-	SSTFile string // 数据所在的文件名
-	Offset  int64  // 数据在文件的哪一个字节开始
-	Size    int    // 数据的长度
+	SSTFile   string
+	Offset    int64
+	Size      int
+	Timestamp int64
+	Deleted   bool
 }
 
+type diskRecord struct {
+	key       string
+	value     string
+	timestamp int64
+	deleted   bool
+}
+
+// KVStore owns every file below dataDir. Different nodes must use different
+// directories; this prevents their WALs and SSTables from being mixed.
 type KVStore struct {
 	mu sync.RWMutex
+
+	dataDir string
+	walPath string
 
 	memTable   map[string]ValueEntry
 	memSize    int
@@ -37,352 +67,635 @@ type KVStore struct {
 
 	walFile   *os.File
 	index     map[string]IndexRecord
-	nextSSTId int
+	nextSSTID int
+
+	stopCh    chan struct{}
+	stopOnce  sync.Once
+	flusherWG sync.WaitGroup
 }
 
-func NewKVStore(walPath string) (*KVStore, error) {
+// NewKVStore opens (or creates) a store rooted at dataDir.
+func NewKVStore(dataDir string) (*KVStore, error) {
+	if dataDir == "" {
+		return nil, errors.New("data directory is empty")
+	}
+	absDir, err := filepath.Abs(dataDir)
+	if err != nil {
+		return nil, fmt.Errorf("resolve data directory: %w", err)
+	}
+	_, statErr := os.Stat(absDir)
+	created := errors.Is(statErr, os.ErrNotExist)
+	if statErr != nil && !created {
+		return nil, fmt.Errorf("stat data directory: %w", statErr)
+	}
+	if err := os.MkdirAll(absDir, 0o755); err != nil {
+		return nil, fmt.Errorf("create data directory: %w", err)
+	}
+	if created {
+		if err := syncDir(filepath.Dir(absDir)); err != nil {
+			return nil, fmt.Errorf("sync data directory parent: %w", err)
+		}
+	}
+
 	kv := &KVStore{
+		dataDir:       absDir,
+		walPath:       filepath.Join(absDir, "wal.log"),
 		memTable:      make(map[string]ValueEntry),
 		maxMemSize:    1000,
 		index:         make(map[string]IndexRecord),
 		lastFlushTime: time.Now(),
 		maxFlushTime:  60 * time.Second,
+		stopCh:        make(chan struct{}),
 	}
 
-	// 扫描历史冷数据，重建内存中 Index 地图
-	kv.loadIndexFromSSTables()
-	// 扫描 WAL，恢复还没有落盘的内容
-	kv.loadFromWAL(walPath)
-
-	file, err := os.OpenFile(walPath, os.O_RDWR|os.O_CREATE|os.O_APPEND, 0666)
+	if err := kv.loadIndexFromSSTables(); err != nil {
+		return nil, err
+	}
+	validWALSize, err := kv.loadFromWAL()
 	if err != nil {
-		return nil, fmt.Errorf("打开 WAL 失败：%v", err)
+		return nil, err
 	}
-	kv.walFile = file
+	if err := kv.openWAL(validWALSize); err != nil {
+		return nil, err
+	}
 
-	go kv.backgroundFlusher() // 后台跑落盘协程
-
+	kv.flusherWG.Add(1)
+	go kv.backgroundFlusher()
 	return kv, nil
 }
 
-func (kv *KVStore) loadIndexFromSSTables() {
-	files, err := filepath.Glob("data_*.sst")
-	if err != nil || len(files) == 0 {
-		return
+func (kv *KVStore) sstableFiles() ([]string, error) {
+	files, err := filepath.Glob(filepath.Join(kv.dataDir, "data_*.sst"))
+	if err != nil {
+		return nil, fmt.Errorf("list SSTables: %w", err)
 	}
-
-	maxId := -1
-	for _, filename := range files {
-		parts := strings.Split(strings.TrimPrefix(filename, "data_"), ".")
-		if len(parts) > 0 {
-			id, _ := strconv.Atoi(parts[0])
-			if id > maxId {
-				maxId = id
-			}
-		}
-
-		file, err := os.Open(filename)
-		if err != nil {
-			continue
-		}
-
-		var currentOffset int64 = 0
-		scanner := bufio.NewScanner(file)
-		for scanner.Scan() {
-			line := scanner.Text() + "\n"
-			size := len(line)
-
-			// SSTable 格式: key,value,timestamp\n — 取第一个逗号前的部分作为 key
-			kvParts := strings.SplitN(strings.TrimSuffix(line, "\n"), ",", 2)
-			if len(kvParts) == 2 {
-				key := kvParts[0]
-				kv.index[key] = IndexRecord{
-					SSTFile: filename,
-					Offset:  currentOffset,
-					Size:    size,
-				}
-			}
-			currentOffset += int64(size)
-		}
-		file.Close()
-		fmt.Printf("[引擎启动] 成功从 %s 重建索引\n", filename)
-	}
-	kv.nextSSTId = maxId + 1
+	sort.Slice(files, func(i, j int) bool { return sstableID(files[i]) < sstableID(files[j]) })
+	return files, nil
 }
 
-// 使用 WAL 恢复还未落盘的热数据
-// WAL 格式: PUT,key,value,timestamp\n
-func (kv *KVStore) loadFromWAL(walPath string) {
-	file, err := os.Open(walPath)
+func sstableID(path string) int {
+	name := filepath.Base(path)
+	id, err := strconv.Atoi(strings.TrimSuffix(strings.TrimPrefix(name, "data_"), ".sst"))
 	if err != nil {
-		return
+		return -1
+	}
+	return id
+}
+
+func (kv *KVStore) loadIndexFromSSTables() error {
+	files, err := kv.sstableFiles()
+	if err != nil {
+		return err
+	}
+	maxID := -1
+	for _, filename := range files {
+		id := sstableID(filename)
+		if id < 0 {
+			continue
+		}
+		if id > maxID {
+			maxID = id
+		}
+		if err := kv.scanSSTable(filename); err != nil {
+			return err
+		}
+	}
+	kv.nextSSTID = maxID + 1
+	return nil
+}
+
+func (kv *KVStore) scanSSTable(path string) error {
+	file, err := os.Open(path)
+	if err != nil {
+		return fmt.Errorf("open SSTable %s: %w", path, err)
+	}
+	defer file.Close()
+	if err := readFileHeader(file, sstMagic); err != nil {
+		return fmt.Errorf("read SSTable %s: %w", path, err)
+	}
+	offset := int64(fileHeaderSize)
+	for {
+		record, size, err := readRecord(file)
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			return fmt.Errorf("read SSTable %s at offset %d: %w", path, offset, err)
+		}
+		old, exists := kv.index[record.key]
+		// Files are scanned by increasing generation. On an equal timestamp,
+		// prefer the newer generation (important after a compaction crash).
+		if !exists || record.timestamp >= old.Timestamp {
+			kv.index[record.key] = IndexRecord{
+				SSTFile: path, Offset: offset, Size: size,
+				Timestamp: record.timestamp, Deleted: record.deleted,
+			}
+		}
+		offset += int64(size)
+	}
+	return nil
+}
+
+// loadFromWAL tolerates only an incomplete final record. This is the expected
+// result of a process/power failure; the valid prefix is returned for truncation.
+func (kv *KVStore) loadFromWAL() (int64, error) {
+	file, err := os.Open(kv.walPath)
+	if errors.Is(err, os.ErrNotExist) {
+		return 0, nil
+	}
+	if err != nil {
+		return 0, fmt.Errorf("open WAL: %w", err)
 	}
 	defer file.Close()
 
-	scanner := bufio.NewScanner(file)
-	count := 0
-	for scanner.Scan() {
-		line := scanner.Text()
-		parts := strings.SplitN(line, ",", 4)
-		if len(parts) >= 3 && parts[0] == "PUT" {
-			key, value := parts[1], parts[2]
-			var ts int64 = 0
-			if len(parts) == 4 {
-				ts, _ = strconv.ParseInt(parts[3], 10, 64)
-			}
-			if _, exist := kv.memTable[key]; !exist {
-				kv.memSize++
-			}
-			kv.memTable[key] = ValueEntry{Value: value, Timestamp: ts}
-			count++
+	info, err := file.Stat()
+	if err != nil {
+		return 0, fmt.Errorf("stat WAL: %w", err)
+	}
+	if info.Size() == 0 {
+		return 0, nil
+	}
+	if err := readFileHeader(file, walMagic); err != nil {
+		return 0, fmt.Errorf("read WAL header: %w", err)
+	}
+	validSize := int64(fileHeaderSize)
+	for {
+		record, size, err := readRecord(file)
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if errors.Is(err, io.ErrUnexpectedEOF) {
+			break
+		}
+		if err != nil {
+			return 0, fmt.Errorf("read WAL at offset %d: %w", validSize, err)
+		}
+		validSize += int64(size)
+		entry, inMem := kv.memTable[record.key]
+		indexed, onDisk := kv.index[record.key]
+		if (inMem && record.timestamp <= entry.Timestamp) || (onDisk && record.timestamp <= indexed.Timestamp) {
+			continue
+		}
+		if !inMem {
+			kv.memSize++
+		}
+		kv.memTable[record.key] = ValueEntry{
+			Value: record.value, Timestamp: record.timestamp, Deleted: record.deleted,
 		}
 	}
-	if count > 0 {
-		fmt.Printf("[引擎启动] 从 WAL 恢复了 %d 条未落盘的热数据\n", count)
-	}
+	return validSize, nil
 }
 
-// Put 写入数据，携带时间戳
+func (kv *KVStore) openWAL(validSize int64) error {
+	file, err := os.OpenFile(kv.walPath, os.O_RDWR|os.O_CREATE, 0o644)
+	if err != nil {
+		return fmt.Errorf("open WAL: %w", err)
+	}
+	failed := true
+	defer func() {
+		if failed {
+			if err := file.Close(); err != nil {
+				fmt.Printf("[storage] close failed WAL handle: %v\n", err)
+			}
+		}
+	}()
+
+	info, err := file.Stat()
+	if err != nil {
+		return fmt.Errorf("stat WAL: %w", err)
+	}
+	if validSize == 0 {
+		if err := file.Truncate(0); err != nil {
+			return fmt.Errorf("initialize WAL: %w", err)
+		}
+		if _, err := file.Seek(0, io.SeekStart); err != nil {
+			return fmt.Errorf("seek WAL: %w", err)
+		}
+		if err := writeAll(file, walMagic[:]); err != nil {
+			return fmt.Errorf("write WAL header: %w", err)
+		}
+		validSize = fileHeaderSize
+	} else if info.Size() != validSize {
+		if err := file.Truncate(validSize); err != nil {
+			return fmt.Errorf("truncate incomplete WAL tail: %w", err)
+		}
+	}
+	if err := file.Sync(); err != nil {
+		return fmt.Errorf("sync WAL: %w", err)
+	}
+	if err := syncDir(kv.dataDir); err != nil {
+		return fmt.Errorf("sync data directory: %w", err)
+	}
+	if _, err := file.Seek(0, io.SeekEnd); err != nil {
+		return fmt.Errorf("seek WAL end: %w", err)
+	}
+	kv.walFile = file
+	failed = false
+	return nil
+}
+
 func (kv *KVStore) Put(key, value string, timestamp int64) error {
+	return kv.put(key, value, timestamp, false)
+}
+
+func (kv *KVStore) Delete(key string, timestamp int64) error {
+	return kv.put(key, "", timestamp, true)
+}
+
+func (kv *KVStore) put(key, value string, timestamp int64, deleted bool) error {
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
-
+	if kv.walFile == nil {
+		return errors.New("store is closed")
+	}
+	if entry, exists := kv.memTable[key]; exists && timestamp <= entry.Timestamp {
+		return nil
+	}
+	if record, exists := kv.index[key]; exists && timestamp <= record.Timestamp {
+		return nil
+	}
 	if kv.memSize >= kv.maxMemSize {
 		if err := kv.flush(); err != nil {
 			return err
 		}
 	}
 
-	// WAL 格式: PUT,key,value,timestamp\n
-	logLine := fmt.Sprintf("PUT,%s,%s,%d\n", key, value, timestamp)
-	kv.walFile.WriteString(logLine)
-	kv.walFile.Sync()
-
-	if _, exist := kv.memTable[key]; !exist {
+	record := diskRecord{key: key, value: value, timestamp: timestamp, deleted: deleted}
+	if _, err := writeRecord(kv.walFile, record); err != nil {
+		return fmt.Errorf("append WAL: %w", err)
+	}
+	if err := kv.walFile.Sync(); err != nil {
+		return fmt.Errorf("sync WAL: %w", err)
+	}
+	if _, exists := kv.memTable[key]; !exists {
 		kv.memSize++
 	}
-	kv.memTable[key] = ValueEntry{Value: value, Timestamp: timestamp}
+	kv.memTable[key] = ValueEntry{Value: value, Timestamp: timestamp, Deleted: deleted}
 	return nil
 }
 
-// Delete 墓碑机制减少 I/O 操作
-func (kv *KVStore) Delete(key string, timestamp int64) error {
-	return kv.Put(key, "<TOMBSTONE>", timestamp)
-}
-
-// Get 读取数据，返回值和时间戳
+// Get returns the legacy tombstone marker for deletes so existing replication
+// code can continue to perform LWW/read-repair without changing its API.
 func (kv *KVStore) Get(key string) (string, int64, bool) {
 	kv.mu.RLock()
 	defer kv.mu.RUnlock()
-
-	if entry, exist := kv.memTable[key]; exist {
-		if entry.Value == "<TOMBSTONE>" {
-			return "", 0, false
+	if entry, exists := kv.memTable[key]; exists {
+		if entry.Deleted {
+			return "<TOMBSTONE>", entry.Timestamp, true
 		}
 		return entry.Value, entry.Timestamp, true
 	}
-
-	record, ok := kv.index[key]
-	if !ok {
+	record, exists := kv.index[key]
+	if !exists {
 		return "", 0, false
 	}
-
-	file, err := os.Open(record.SSTFile)
+	entry, err := readRecordAt(record)
 	if err != nil {
 		return "", 0, false
 	}
-	defer file.Close()
-
-	file.Seek(record.Offset, 0)
-	buffer := make([]byte, record.Size)
-	file.Read(buffer)
-
-	line := string(buffer)
-	// SSTable 格式: key,value,timestamp\n
-	parts := strings.SplitN(strings.TrimSuffix(line, "\n"), ",", 3)
-	if len(parts) >= 2 {
-		value := parts[1]
-		var ts int64 = 0
-		if len(parts) == 3 {
-			ts, _ = strconv.ParseInt(parts[2], 10, 64)
-		}
-		if value == "<TOMBSTONE>" {
-			return "", 0, false
-		}
-		return value, ts, true
+	if entry.deleted {
+		return "<TOMBSTONE>", entry.timestamp, true
 	}
-	return "", 0, false
+	return entry.value, entry.timestamp, true
+}
+
+func readRecordAt(index IndexRecord) (diskRecord, error) {
+	file, err := os.Open(index.SSTFile)
+	if err != nil {
+		return diskRecord{}, err
+	}
+	defer file.Close()
+	section := io.NewSectionReader(file, index.Offset, int64(index.Size))
+	record, _, err := readRecord(section)
+	return record, err
 }
 
 func (kv *KVStore) flush() error {
 	if kv.memSize == 0 {
 		return nil
 	}
-
-	sstFile := fmt.Sprintf("data_%d.sst", kv.nextSSTId)
-	file, err := os.Create(sstFile)
+	finalPath := filepath.Join(kv.dataDir, fmt.Sprintf("data_%d.sst", kv.nextSSTID))
+	temp, err := os.CreateTemp(kv.dataDir, ".flush-*.tmp")
 	if err != nil {
-		return err
+		return fmt.Errorf("create temporary SSTable: %w", err)
 	}
-	defer file.Close()
+	tempPath := temp.Name()
+	committed := false
+	defer func() {
+		if !committed {
+			if err := temp.Close(); err != nil && !errors.Is(err, os.ErrClosed) {
+				fmt.Printf("[storage] close failed flush file: %v\n", err)
+			}
+			if err := os.Remove(tempPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+				fmt.Printf("[storage] remove failed flush file: %v\n", err)
+			}
+		}
+	}()
 
+	if err := writeAll(temp, sstMagic[:]); err != nil {
+		return fmt.Errorf("write SSTable header: %w", err)
+	}
 	keys := make([]string, 0, len(kv.memTable))
-	for k := range kv.memTable {
-		keys = append(keys, k)
+	for key := range kv.memTable {
+		keys = append(keys, key)
 	}
-	slices.Sort(keys)
-
-	var currentOffset int64 = 0
+	sort.Strings(keys)
+	offset := int64(fileHeaderSize)
+	newRecords := make(map[string]IndexRecord, len(keys))
 	for _, key := range keys {
 		entry := kv.memTable[key]
-		// SSTable 格式: key,value,timestamp\n
-		line := fmt.Sprintf("%s,%s,%d\n", key, entry.Value, entry.Timestamp)
-		n, _ := file.WriteString(line)
-
-		kv.index[key] = IndexRecord{
-			SSTFile: sstFile,
-			Offset:  currentOffset,
-			Size:    n,
+		size, err := writeRecord(temp, diskRecord{
+			key: key, value: entry.Value, timestamp: entry.Timestamp, deleted: entry.Deleted,
+		})
+		if err != nil {
+			return fmt.Errorf("write SSTable record: %w", err)
 		}
-		currentOffset += int64(n)
+		newRecords[key] = IndexRecord{
+			SSTFile: finalPath, Offset: offset, Size: size,
+			Timestamp: entry.Timestamp, Deleted: entry.Deleted,
+		}
+		offset += int64(size)
 	}
+	if err := temp.Sync(); err != nil {
+		return fmt.Errorf("sync temporary SSTable: %w", err)
+	}
+	if err := temp.Close(); err != nil {
+		return fmt.Errorf("close temporary SSTable: %w", err)
+	}
+	if err := os.Rename(tempPath, finalPath); err != nil {
+		return fmt.Errorf("publish SSTable: %w", err)
+	}
+	if err := syncDir(kv.dataDir); err != nil {
+		return fmt.Errorf("sync SSTable directory: %w", err)
+	}
+	committed = true
 
-	kv.nextSSTId++
+	// The SSTable is durable before the WAL is reset. A crash between these
+	// steps merely replays duplicates, which LWW safely ignores.
+	if err := kv.resetWAL(); err != nil {
+		return err
+	}
+	for key, record := range newRecords {
+		kv.index[key] = record
+	}
+	kv.nextSSTID++
 	kv.memTable = make(map[string]ValueEntry)
 	kv.memSize = 0
-
-	kv.walFile.Truncate(0)
-	kv.walFile.Seek(0, 0)
 	kv.lastFlushTime = time.Now()
-
-	fmt.Printf("[存储引擎] 成功生成 SSTable: %s\n", sstFile)
 	return nil
 }
 
-// backgroundFlusher 后台巡逻
+func (kv *KVStore) resetWAL() error {
+	if err := kv.walFile.Truncate(0); err != nil {
+		return fmt.Errorf("truncate WAL: %w", err)
+	}
+	if _, err := kv.walFile.Seek(0, io.SeekStart); err != nil {
+		return fmt.Errorf("seek WAL: %w", err)
+	}
+	if err := writeAll(kv.walFile, walMagic[:]); err != nil {
+		return fmt.Errorf("rewrite WAL header: %w", err)
+	}
+	if err := kv.walFile.Sync(); err != nil {
+		return fmt.Errorf("sync reset WAL: %w", err)
+	}
+	return nil
+}
+
 func (kv *KVStore) backgroundFlusher() {
-	ticker := time.NewTicker(1 * time.Second)
+	defer kv.flusherWG.Done()
+	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
-
-	for range ticker.C {
-		kv.mu.Lock()
-		if kv.memSize > 0 && time.Since(kv.lastFlushTime) >= kv.maxFlushTime {
-			fmt.Println("[后台巡逻] 触发时间阈值，强制生成冷数据...")
-			kv.flush()
+	for {
+		select {
+		case <-ticker.C:
+			kv.mu.Lock()
+			if kv.memSize > 0 && time.Since(kv.lastFlushTime) >= kv.maxFlushTime {
+				if err := kv.flush(); err != nil {
+					fmt.Printf("[storage] background flush failed: %v\n", err)
+				}
+			}
+			files, err := kv.sstableFiles()
+			if err != nil {
+				fmt.Printf("[storage] list SSTables failed: %v\n", err)
+			} else if len(files) >= 5 {
+				if err := kv.compact(); err != nil {
+					fmt.Printf("[storage] background compaction failed: %v\n", err)
+				}
+			}
+			kv.mu.Unlock()
+		case <-kv.stopCh:
+			return
 		}
-
-		files, _ := filepath.Glob("data_*.sst")
-		// SST 文件超过 5 个就自动合并
-		if len(files) >= 5 {
-			fmt.Println("[后台巡逻] SST 文件过多，触发自动合并...")
-			kv.compact()
-		}
-
-		kv.mu.Unlock()
 	}
 }
 
-// Compact 对外暴露的合并接口（加锁）
 func (kv *KVStore) Compact() error {
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
+	if kv.walFile == nil {
+		return errors.New("store is closed")
+	}
 	return kv.compact()
 }
 
-// compact 内部合并逻辑
 func (kv *KVStore) compact() error {
 	if kv.memSize > 0 {
 		if err := kv.flush(); err != nil {
 			return err
 		}
 	}
-
-	files, err := filepath.Glob("data_*.sst")
+	oldFiles, err := kv.sstableFiles()
 	if err != nil {
 		return err
 	}
-
-	// 用于暂存所有有效数据的临时切片
-	type kvPair struct {
-		key string
-		val string
-		ts  int64
-	}
-	var validData []kvPair
-
-	// 顺序读取所有旧文件，过滤出有效数据
-	for _, filename := range files {
-		file, err := os.Open(filename)
-		if err != nil {
-			continue
-		}
-
-		scanner := bufio.NewScanner(file)
-		// 逐行读取旧文件
-		for scanner.Scan() {
-			line := scanner.Text()
-			parts := strings.SplitN(line, ",", 3)
-
-			if len(parts) >= 2 {
-				key := parts[0]
-				val := parts[1]
-				var ts int64 = 0
-				if len(parts) == 3 {
-					ts, _ = strconv.ParseInt(parts[2], 10, 64)
-				}
-
-				// 根据"全局最新文件名"过滤！
-				record, exists := kv.index[key]
-				if exists && record.SSTFile == filename {
-					if val != "<TOMBSTONE>" {
-						validData = append(validData, kvPair{key, val, ts})
-					}
-				}
-			}
-		}
-		file.Close()
-		// 读完删除旧文件
-		os.Remove(filename)
-	}
-
-	// 没有拿到有效数据，直接返回
-	if len(validData) == 0 {
-		fmt.Println("[存储引擎] 垃圾回收完成！没有有效数据需要保留。")
+	if len(oldFiles) <= 1 {
 		return nil
 	}
 
-	// 对收集到的所有有效数据进行全局字典序排序
-	sort.Slice(validData, func(i, j int) bool {
-		return validData[i].key < validData[j].key
-	})
+	keys := make([]string, 0, len(kv.index))
+	for key := range kv.index {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	records := make([]diskRecord, 0, len(keys))
+	for _, key := range keys {
+		record, err := readRecordAt(kv.index[key])
+		if err != nil {
+			return fmt.Errorf("read current value for %q: %w", key, err)
+		}
+		records = append(records, record)
+	}
 
-	// 将全局排序后的数据写入一个全新的 SSTable
-	compactFileName := fmt.Sprintf("data_%d.sst", kv.nextSSTId)
-	compactFile, err := os.Create(compactFileName)
+	finalPath := filepath.Join(kv.dataDir, fmt.Sprintf("data_%d.sst", kv.nextSSTID))
+	temp, err := os.CreateTemp(kv.dataDir, ".compact-*.tmp")
+	if err != nil {
+		return fmt.Errorf("create compaction file: %w", err)
+	}
+	tempPath := temp.Name()
+	committed := false
+	defer func() {
+		if !committed {
+			if err := temp.Close(); err != nil && !errors.Is(err, os.ErrClosed) {
+				fmt.Printf("[storage] close failed compaction file: %v\n", err)
+			}
+			if err := os.Remove(tempPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+				fmt.Printf("[storage] remove failed compaction file: %v\n", err)
+			}
+		}
+	}()
+	if err := writeAll(temp, sstMagic[:]); err != nil {
+		return fmt.Errorf("write compacted SSTable header: %w", err)
+	}
+	newIndex := make(map[string]IndexRecord, len(records))
+	offset := int64(fileHeaderSize)
+	for _, record := range records {
+		size, err := writeRecord(temp, record)
+		if err != nil {
+			return fmt.Errorf("write compacted SSTable record: %w", err)
+		}
+		newIndex[record.key] = IndexRecord{
+			SSTFile: finalPath, Offset: offset, Size: size,
+			Timestamp: record.timestamp, Deleted: record.deleted,
+		}
+		offset += int64(size)
+	}
+	if err := temp.Sync(); err != nil {
+		return fmt.Errorf("sync compacted SSTable: %w", err)
+	}
+	if err := temp.Close(); err != nil {
+		return fmt.Errorf("close compacted SSTable: %w", err)
+	}
+	if err := os.Rename(tempPath, finalPath); err != nil {
+		return fmt.Errorf("publish compacted SSTable: %w", err)
+	}
+	if err := syncDir(kv.dataDir); err != nil {
+		return fmt.Errorf("sync compacted SSTable directory: %w", err)
+	}
+	committed = true
+
+	// Publish the new in-memory view only after rename+fsync. Old files are
+	// removed afterwards, so every crash point leaves at least one full copy.
+	kv.index = newIndex
+	kv.nextSSTID++
+	for _, path := range oldFiles {
+		if path == finalPath {
+			continue
+		}
+		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("remove old SSTable %s: %w", path, err)
+		}
+	}
+	if err := syncDir(kv.dataDir); err != nil {
+		return fmt.Errorf("sync SSTable removals: %w", err)
+	}
+	return nil
+}
+
+// Close performs a durable flush and stops the background worker.
+func (kv *KVStore) Close() error {
+	kv.stopOnce.Do(func() { close(kv.stopCh) })
+	kv.flusherWG.Wait()
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+	if kv.walFile == nil {
+		return nil
+	}
+	var result error
+	if err := kv.flush(); err != nil {
+		result = err
+	}
+	if err := kv.walFile.Close(); err != nil {
+		result = errors.Join(result, fmt.Errorf("close WAL: %w", err))
+	}
+	kv.walFile = nil
+	return result
+}
+
+func writeRecord(w io.Writer, record diskRecord) (int, error) {
+	keyLen, valueLen := uint64(len(record.key)), uint64(len(record.value))
+	if keyLen > maxRecordBytes || valueLen > maxRecordBytes {
+		return 0, errors.New("key or value exceeds uint32 encoding limit")
+	}
+	header := make([]byte, recordHeaderSize)
+	if record.deleted {
+		header[0] = opDelete
+	} else {
+		header[0] = opPut
+	}
+	binary.BigEndian.PutUint64(header[1:9], uint64(record.timestamp))
+	binary.BigEndian.PutUint32(header[9:13], uint32(keyLen))
+	binary.BigEndian.PutUint32(header[13:17], uint32(valueLen))
+	if err := writeAll(w, header); err != nil {
+		return 0, err
+	}
+	if err := writeAll(w, []byte(record.key)); err != nil {
+		return 0, err
+	}
+	if err := writeAll(w, []byte(record.value)); err != nil {
+		return 0, err
+	}
+	return recordHeaderSize + len(record.key) + len(record.value), nil
+}
+
+func readRecord(r io.Reader) (diskRecord, int, error) {
+	header := make([]byte, recordHeaderSize)
+	if _, err := io.ReadFull(r, header); err != nil {
+		return diskRecord{}, 0, err
+	}
+	if header[0] != opPut && header[0] != opDelete {
+		return diskRecord{}, 0, fmt.Errorf("unknown operation %d", header[0])
+	}
+	keyLen := uint64(binary.BigEndian.Uint32(header[9:13]))
+	valueLen := uint64(binary.BigEndian.Uint32(header[13:17]))
+	total := uint64(recordHeaderSize) + keyLen + valueLen
+	if total > uint64(int(^uint(0)>>1)) {
+		return diskRecord{}, 0, errors.New("record is too large for this platform")
+	}
+	payload := make([]byte, int(keyLen+valueLen))
+	if _, err := io.ReadFull(r, payload); err != nil {
+		return diskRecord{}, 0, err
+	}
+	return diskRecord{
+		key: string(payload[:keyLen]), value: string(payload[keyLen:]),
+		timestamp: int64(binary.BigEndian.Uint64(header[1:9])), deleted: header[0] == opDelete,
+	}, int(total), nil
+}
+
+func readFileHeader(r io.Reader, expected [fileHeaderSize]byte) error {
+	header := make([]byte, fileHeaderSize)
+	if _, err := io.ReadFull(r, header); err != nil {
+		return err
+	}
+	if string(header) != string(expected[:]) {
+		return errors.New("unsupported or corrupt file format")
+	}
+	return nil
+}
+
+func writeAll(w io.Writer, data []byte) error {
+	for len(data) > 0 {
+		n, err := w.Write(data)
+		if err != nil {
+			return err
+		}
+		if n == 0 {
+			return io.ErrShortWrite
+		}
+		data = data[n:]
+	}
+	return nil
+}
+
+func syncDir(path string) error {
+	dir, err := os.Open(path)
 	if err != nil {
 		return err
 	}
-	defer compactFile.Close()
-
-	var currentOffset int64 = 0
-	newIndex := make(map[string]IndexRecord)
-
-	for _, pair := range validData {
-		line := fmt.Sprintf("%s,%s,%d\n", pair.key, pair.val, pair.ts)
-		n, _ := compactFile.WriteString(line)
-
-		newIndex[pair.key] = IndexRecord{
-			SSTFile: compactFileName,
-			Offset:  currentOffset,
-			Size:    n,
+	if err := dir.Sync(); err != nil {
+		if closeErr := dir.Close(); closeErr != nil {
+			return errors.Join(err, closeErr)
 		}
-		currentOffset += int64(n)
+		return err
 	}
-
-	// 将旧坐标本替换为全新的坐标本
-	kv.index = newIndex
-	kv.nextSSTId++
-
-	fmt.Printf("[存储引擎] 垃圾回收完成！已生成全局纯净且排序的文件: %s\n", compactFileName)
-	return nil
+	return dir.Close()
 }
