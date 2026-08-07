@@ -15,6 +15,7 @@ func TestRecordEncodingSupportsArbitraryStrings(t *testing.T) {
 		key:       "key,with\nnewlines\x00and-中文",
 		value:     "value,\r\n\x00<ＴＯＭＢＳＴＯＮＥ>🙂",
 		timestamp: -42,
+		type_:     ValuePut,
 	}
 	var encoded bytes.Buffer
 	size, err := writeRecord(&encoded, want)
@@ -84,11 +85,11 @@ func TestFlushCompactionAndReopen(t *testing.T) {
 	assertGet(t, reopened, "a,\n\x00", "new,<TOMBSTONE>\nvalue", 3)
 	assertGet(t, reopened, "二号键", "🙂\r\nvalue", 2)
 	assertGet(t, reopened, "literal-tombstone", "<TOMBSTONE>", 4)
-	assertGet(t, reopened, "deleted,\nkey", "<TOMBSTONE>", 5)
-	if reopened.index["literal-tombstone"].Deleted {
+	assertDeleted(t, reopened, "deleted,\nkey", 5)
+	if reopened.index["literal-tombstone"].Type == ValueDelete {
 		t.Fatal("literal tombstone value was decoded as a delete operation")
 	}
-	if !reopened.index["deleted,\nkey"].Deleted {
+	if reopened.index["deleted,\nkey"].Type != ValueDelete {
 		t.Fatal("delete operation lost its explicit tombstone bit")
 	}
 }
@@ -129,11 +130,11 @@ func TestStoresUseIsolatedDataDirectories(t *testing.T) {
 	}
 	defer second.Close()
 	assertGet(t, first, "only-first", "one", 1)
-	if _, _, ok := first.Get("only-second"); ok {
+	if first.Get("only-second").Found {
 		t.Fatal("first node read second node's SSTable")
 	}
 	assertGet(t, second, "only-second", "two", 1)
-	if _, _, ok := second.Get("only-first"); ok {
+	if second.Get("only-first").Found {
 		t.Fatal("second node read first node's SSTable")
 	}
 }
@@ -282,11 +283,92 @@ func TestReadRecordRejectsTruncatedPayload(t *testing.T) {
 
 func assertGet(t *testing.T, store *KVStore, key, wantValue string, wantTimestamp int64) {
 	t.Helper()
-	value, timestamp, ok := store.Get(key)
-	if !ok {
+	result := store.Get(key)
+	if !result.Found || result.Deleted {
 		t.Fatalf("Get(%q) did not find key", key)
 	}
-	if value != wantValue || timestamp != wantTimestamp {
-		t.Fatalf("Get(%q) = (%q, %d), want (%q, %d)", key, value, timestamp, wantValue, wantTimestamp)
+	if string(result.Value) != wantValue || result.Timestamp != wantTimestamp {
+		t.Fatalf("Get(%q) = (%q, %d), want (%q, %d)", key, result.Value, result.Timestamp, wantValue, wantTimestamp)
+	}
+}
+
+func assertDeleted(t *testing.T, store *KVStore, key string, wantTimestamp int64) {
+	t.Helper()
+	result := store.Get(key)
+	if result.Found || !result.Deleted || result.Timestamp != wantTimestamp {
+		t.Fatalf("Get(%q) = %#v, want deleted version %d", key, result, wantTimestamp)
+	}
+}
+
+func TestLWWDeleteAndTypedReadResult(t *testing.T) {
+	store, err := NewKVStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	if err := store.Put("key", "old", 10); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Delete("key", 20); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Put("key", "stale", 15); err != nil {
+		t.Fatal(err)
+	}
+	assertDeleted(t, store, "key", 20)
+
+	if err := store.Put("literal", "<TOMBSTONE>", 30); err != nil {
+		t.Fatal(err)
+	}
+	assertGet(t, store, "literal", "<TOMBSTONE>", 30)
+}
+
+func TestVersionConflictsAreDeterministic(t *testing.T) {
+	store, err := NewKVStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	if err := store.Put("key", "alpha", 10); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Put("key", "zulu", 10); err != nil {
+		t.Fatal(err)
+	}
+	assertGet(t, store, "key", "zulu", 10)
+	if err := store.Delete("key", 10); err != nil {
+		t.Fatal(err)
+	}
+	assertDeleted(t, store, "key", 10)
+}
+
+func TestEmptyKeyAndValueAreValid(t *testing.T) {
+	store, err := NewKVStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if err := store.Put("", "", 1); err != nil {
+		t.Fatal(err)
+	}
+	assertGet(t, store, "", "", 1)
+}
+
+func BenchmarkPutAndGet(b *testing.B) {
+	store, err := NewKVStore(b.TempDir())
+	if err != nil {
+		b.Fatal(err)
+	}
+	b.Cleanup(func() { _ = store.Close() })
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if err := store.Put("key", "value", int64(i+1)); err != nil {
+			b.Fatal(err)
+		}
+		if result := store.Get("key"); !result.Found || string(result.Value) != "value" {
+			b.Fatalf("Get = %#v", result)
+		}
 	}
 }

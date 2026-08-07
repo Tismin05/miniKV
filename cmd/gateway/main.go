@@ -7,6 +7,7 @@ import (
 	"log"
 	"net/http"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"google.golang.org/grpc"
@@ -16,7 +17,25 @@ import (
 	"miniKV/internal/router"
 )
 
-// getGRPCClient 连接到目标 gRPC 节点
+var lastTimestamp atomic.Int64
+
+// nextTimestamp 返回进程内严格递增的 Unix 纳秒版本，避免同一时钟刻度内的
+// 两个网关请求得到相同的 LWW 时间戳。
+func nextTimestamp() int64 {
+	for {
+		now := time.Now().UnixNano()
+		last := lastTimestamp.Load()
+		if now <= last {
+			now = last + 1
+		}
+		if lastTimestamp.CompareAndSwap(last, now) {
+			return now
+		}
+	}
+}
+
+// getGRPCClient 创建短生命周期的客户端连接。调用方拥有该连接，并必须在 RPC
+// 完成后关闭它。
 func getGRPCClient(addr string) (kvpb.KVServiceClient, *grpc.ClientConn, error) {
 	conn, err := grpc.NewClient(addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
@@ -45,7 +64,7 @@ func main() {
 	http.HandleFunc("/put", func(w http.ResponseWriter, r *http.Request) {
 		key := r.URL.Query().Get("key")
 		val := r.URL.Query().Get("value")
-		if key == "" || val == "" {
+		if key == "" {
 			http.Error(w, "缺少参数 key 或 value", http.StatusBadRequest)
 			return
 		}
@@ -57,8 +76,8 @@ func main() {
 		}
 		fmt.Printf("[路由日志] PUT 键 '%s' -> 副本群: %v\n", key, targetNodes)
 
-		// 网关生成时间戳，保证所有副本的同一次写入拥有相同版本
-		ts := time.Now().UnixNano()
+		// 同一个 timestamp 让本次写入的全部副本视为同一个 LWW 版本。
+		ts := nextTimestamp()
 
 		// 并发写入所有副本
 		var mu sync.Mutex
@@ -90,6 +109,10 @@ func main() {
 					return
 				}
 
+				if !resp.Success {
+					fmt.Printf("[路由日志] 写入节点 [%s] 被拒绝：%s\n", node, resp.Message)
+					return
+				}
 				fmt.Printf("[路由日志] 写入节点 [%s] 成功：%s\n", node, resp.Message)
 				mu.Lock()
 				successCount++
@@ -150,7 +173,8 @@ func main() {
 			}(node)
 		}
 
-		// 收集 R 个成功结果，比较时间戳取最新
+		// 比较每个有响应的副本，避免较旧的 Value 掩盖较新的 tombstone；
+		// ReadQuorum 仍是返回结果所需的最少成功响应数。
 		var bestResp *kvpb.GetResponse
 		var bestNode string
 		successCount := 0
@@ -161,24 +185,26 @@ func main() {
 				fmt.Printf("[路由日志] 查询节点 [%s] 失败：%v\n", res.node, res.err)
 				continue
 			}
-			if res.resp == nil || !res.resp.Found {
+			if res.resp == nil {
 				continue
 			}
 
 			successCount++
-			// 比较 kv 时间戳，保留最新的版本
-			if bestResp == nil || res.resp.Timestamp > bestResp.Timestamp {
+			if !res.resp.Found && !res.resp.Deleted {
+				continue
+			}
+			// Timestamp 是主版本。相同时 Delete 优先；两个 Put 则与存储层
+			// 一样按 Value 字典序决胜。
+			if bestResp == nil || res.resp.Timestamp > bestResp.Timestamp ||
+				(res.resp.Timestamp == bestResp.Timestamp && ((res.resp.Deleted && !bestResp.Deleted) ||
+					(!res.resp.Deleted && !bestResp.Deleted && res.resp.Value > bestResp.Value))) {
 				bestResp = res.resp
 				bestNode = res.node
 			}
 
-			// 已经拿到 R 个成功结果，可以提前返回
-			if successCount >= ReadQuorum {
-				break
-			}
 		}
 
-		if bestResp != nil {
+		if successCount >= ReadQuorum && bestResp != nil && bestResp.Found && !bestResp.Deleted {
 			fmt.Printf("[路由日志] GET 键 '%s' 命中节点 [%s], 时间戳: %d\n", key, bestNode, bestResp.Timestamp)
 			w.Header().Set("Content-Type", "application/json")
 			json.NewEncoder(w).Encode(map[string]interface{}{
@@ -208,6 +234,8 @@ func main() {
 			return
 		}
 		fmt.Printf("[路由日志] DEL 键 '%s' -> 副本群: %v\n", key, targetNodes)
+		// Delete 必须与 Put 一样使用网关生成的 LWW 版本。
+		ts := nextTimestamp()
 
 		var mu sync.Mutex
 		successCount := 0
@@ -228,12 +256,16 @@ func main() {
 				ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 				defer cancel()
 
-				resp, err := client.Delete(ctx, &kvpb.DeleteRequest{Key: key})
+				resp, err := client.Delete(ctx, &kvpb.DeleteRequest{Key: key, Timestamp: ts})
 				if err != nil {
 					fmt.Printf("[路由日志] 删除节点 [%s] 失败：%v\n", node, err)
 					return
 				}
 
+				if !resp.Success {
+					fmt.Printf("[路由日志] 删除节点 [%s] 被拒绝：%s\n", node, resp.Message)
+					return
+				}
 				fmt.Printf("[路由日志] 删除节点 [%s] 成功：%s\n", node, resp.Message)
 				mu.Lock()
 				successCount++

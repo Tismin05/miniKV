@@ -16,7 +16,7 @@ import (
 
 const (
 	fileHeaderSize   = 8
-	recordHeaderSize = 17
+	recordHeaderSize = 25
 	maxRecordBytes   = uint64(^uint32(0))
 
 	opPut    byte = 1
@@ -24,57 +24,56 @@ const (
 )
 
 var (
-	walMagic = [fileHeaderSize]byte{'M', 'K', 'V', 'W', 'A', 'L', 1, 0}
-	sstMagic = [fileHeaderSize]byte{'M', 'K', 'V', 'S', 'S', 'T', 1, 0}
+	walMagic = [fileHeaderSize]byte{'M', 'K', 'V', 'W', 'A', 'L', 2, 0}
+	sstMagic = [fileHeaderSize]byte{'M', 'K', 'V', 'S', 'S', 'T', 2, 0}
 )
 
-// ValueEntry stores a value and its timestamp for LWW conflict resolution.
-type ValueEntry struct {
-	Value     string
-	Timestamp int64
-	Deleted   bool
-}
-
+// IndexRecord 指向某个 key 当前胜出的磁盘条目。实际 Value 仍保存在 SSTable，
+// 从而让内存索引保持紧凑。
 type IndexRecord struct {
 	SSTFile   string
 	Offset    int64
 	Size      int
+	Sequence  uint64
 	Timestamp int64
-	Deleted   bool
+	Type      ValueType
 }
 
 type diskRecord struct {
 	key       string
 	value     string
+	sequence  uint64
 	timestamp int64
-	deleted   bool
+	type_     ValueType
 }
 
-// KVStore owns every file below dataDir. Different nodes must use different
-// directories; this prevents their WALs and SSTables from being mixed.
+// KVStore 管理 dataDir 下的全部文件。不同节点必须使用不同目录，
+// 以免彼此的 WAL 和 SSTable 混在一起。
 type KVStore struct {
 	mu sync.RWMutex
 
 	dataDir string
 	walPath string
 
-	memTable   map[string]ValueEntry
+	memTable   map[string]InternalEntry
 	memSize    int
 	maxMemSize int
 
 	lastFlushTime time.Time
 	maxFlushTime  time.Duration
 
-	walFile   *os.File
-	index     map[string]IndexRecord
-	nextSSTID int
+	walFile      *os.File
+	index        map[string]IndexRecord
+	nextSSTID    int
+	nextSequence uint64
 
 	stopCh    chan struct{}
 	stopOnce  sync.Once
 	flusherWG sync.WaitGroup
 }
 
-// NewKVStore opens (or creates) a store rooted at dataDir.
+// NewKVStore 打开（或创建）以 dataDir 为根目录的存储。启动时先建立 SSTable
+// 索引，再回放 WAL，最后才接收新写入；这样 WAL 条目可以按 LWW 覆盖磁盘条目。
 func NewKVStore(dataDir string) (*KVStore, error) {
 	if dataDir == "" {
 		return nil, errors.New("data directory is empty")
@@ -100,7 +99,7 @@ func NewKVStore(dataDir string) (*KVStore, error) {
 	kv := &KVStore{
 		dataDir:       absDir,
 		walPath:       filepath.Join(absDir, "wal.log"),
-		memTable:      make(map[string]ValueEntry),
+		memTable:      make(map[string]InternalEntry),
 		maxMemSize:    1000,
 		index:         make(map[string]IndexRecord),
 		lastFlushTime: time.Now(),
@@ -142,6 +141,8 @@ func sstableID(path string) int {
 	return id
 }
 
+// loadIndexFromSSTables 重建点查索引，并让文件编号和本地 sequence
+// 都越过所有已持久化的 SSTable 条目。
 func (kv *KVStore) loadIndexFromSSTables() error {
 	files, err := kv.sstableFiles()
 	if err != nil {
@@ -164,6 +165,8 @@ func (kv *KVStore) loadIndexFromSSTables() error {
 	return nil
 }
 
+// scanSSTable 遍历一个不可变文件的全部条目，并只在 kv.index 中保留每个 key
+// 的 LWW 胜出版本。
 func (kv *KVStore) scanSSTable(path string) error {
 	file, err := os.Open(path)
 	if err != nil {
@@ -183,21 +186,33 @@ func (kv *KVStore) scanSSTable(path string) error {
 			return fmt.Errorf("read SSTable %s at offset %d: %w", path, offset, err)
 		}
 		old, exists := kv.index[record.key]
-		// Files are scanned by increasing generation. On an equal timestamp,
-		// prefer the newer generation (important after a compaction crash).
-		if !exists || record.timestamp >= old.Timestamp {
+		// 文件按 generation 递增扫描；时间戳相同时优先新文件，
+		// 这能正确处理 compaction 发布后、旧文件删除前的崩溃恢复。
+		candidate := entryFromDisk(record)
+		wins := !exists
+		if exists {
+			current, err := entryFromIndex(old)
+			if err != nil {
+				return fmt.Errorf("read indexed record for %q: %w", record.key, err)
+			}
+			wins = compareVersions(candidate, current) >= 0
+		}
+		if wins {
 			kv.index[record.key] = IndexRecord{
 				SSTFile: path, Offset: offset, Size: size,
-				Timestamp: record.timestamp, Deleted: record.deleted,
+				Sequence: record.sequence, Timestamp: record.timestamp, Type: record.type_,
 			}
+		}
+		if record.sequence > kv.nextSequence {
+			kv.nextSequence = record.sequence
 		}
 		offset += int64(size)
 	}
 	return nil
 }
 
-// loadFromWAL tolerates only an incomplete final record. This is the expected
-// result of a process/power failure; the valid prefix is returned for truncation.
+// loadFromWAL 只容忍末尾记录不完整，这是进程或电源故障的预期结果；
+// 返回的有效前缀会在后续打开 WAL 时截断保留。
 func (kv *KVStore) loadFromWAL() (int64, error) {
 	file, err := os.Open(kv.walPath)
 	if errors.Is(err, os.ErrNotExist) {
@@ -233,19 +248,32 @@ func (kv *KVStore) loadFromWAL() (int64, error) {
 		validSize += int64(size)
 		entry, inMem := kv.memTable[record.key]
 		indexed, onDisk := kv.index[record.key]
-		if (inMem && record.timestamp <= entry.Timestamp) || (onDisk && record.timestamp <= indexed.Timestamp) {
+		candidate := entryFromDisk(record)
+		if inMem && compareVersions(candidate, entry) <= 0 {
 			continue
+		}
+		if onDisk {
+			indexedEntry, err := entryFromIndex(indexed)
+			if err != nil {
+				return 0, fmt.Errorf("read indexed record for %q: %w", record.key, err)
+			}
+			if compareVersions(candidate, indexedEntry) <= 0 {
+				continue
+			}
 		}
 		if !inMem {
 			kv.memSize++
 		}
-		kv.memTable[record.key] = ValueEntry{
-			Value: record.value, Timestamp: record.timestamp, Deleted: record.deleted,
+		kv.memTable[record.key] = candidate
+		if record.sequence > kv.nextSequence {
+			kv.nextSequence = record.sequence
 		}
 	}
 	return validSize, nil
 }
 
+// openWAL 为新 WAL 写入文件头，或截断恢复阶段发现的损坏尾部。重新追加前，
+// 文件头和截断结果都必须先同步到磁盘。
 func (kv *KVStore) openWAL(validSize int64) error {
 	file, err := os.OpenFile(kv.walPath, os.O_RDWR|os.O_CREATE, 0o644)
 	if err != nil {
@@ -294,25 +322,38 @@ func (kv *KVStore) openWAL(validSize int64) error {
 	return nil
 }
 
+// Put 写入一个带版本的值。Timestamp 是跨节点的 LWW 版本；候选值在本地胜出后
+// 才由存储层分配 sequence。
 func (kv *KVStore) Put(key, value string, timestamp int64) error {
-	return kv.put(key, value, timestamp, false)
+	return kv.put(key, value, timestamp, ValuePut)
 }
 
+// Delete 写入一个带版本的 tombstone。它与 Put 使用相同的 LWW 时间戳语义，
+// 且永远不会编码为对用户可见的特殊值。
 func (kv *KVStore) Delete(key string, timestamp int64) error {
-	return kv.put(key, "", timestamp, true)
+	return kv.put(key, "", timestamp, ValueDelete)
 }
 
-func (kv *KVStore) put(key, value string, timestamp int64, deleted bool) error {
+// put 是唯一的写入路径。它会在追加 WAL 前拒绝 LWW 失效候选值；已接受的条目
+// 必须先 fsync 到 WAL，之后才能从 MemTable 读取。
+func (kv *KVStore) put(key, value string, timestamp int64, valueType ValueType) error {
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
 	if kv.walFile == nil {
 		return errors.New("store is closed")
 	}
-	if entry, exists := kv.memTable[key]; exists && timestamp <= entry.Timestamp {
+	candidate := InternalEntry{Key: key, Value: []byte(value), Timestamp: timestamp, Type: valueType}
+	if entry, exists := kv.memTable[key]; exists && compareVersions(candidate, entry) <= 0 {
 		return nil
 	}
-	if record, exists := kv.index[key]; exists && timestamp <= record.Timestamp {
-		return nil
+	if record, exists := kv.index[key]; exists {
+		indexedEntry, err := entryFromIndex(record)
+		if err != nil {
+			return fmt.Errorf("read indexed record for %q: %w", key, err)
+		}
+		if compareVersions(candidate, indexedEntry) <= 0 {
+			return nil
+		}
 	}
 	if kv.memSize >= kv.maxMemSize {
 		if err := kv.flush(); err != nil {
@@ -320,7 +361,9 @@ func (kv *KVStore) put(key, value string, timestamp int64, deleted bool) error {
 		}
 	}
 
-	record := diskRecord{key: key, value: value, timestamp: timestamp, deleted: deleted}
+	kv.nextSequence++
+	candidate.Sequence = kv.nextSequence
+	record := diskFromEntry(candidate)
 	if _, err := writeRecord(kv.walFile, record); err != nil {
 		return fmt.Errorf("append WAL: %w", err)
 	}
@@ -330,35 +373,30 @@ func (kv *KVStore) put(key, value string, timestamp int64, deleted bool) error {
 	if _, exists := kv.memTable[key]; !exists {
 		kv.memSize++
 	}
-	kv.memTable[key] = ValueEntry{Value: value, Timestamp: timestamp, Deleted: deleted}
+	kv.memTable[key] = candidate
 	return nil
 }
 
-// Get returns the legacy tombstone marker for deletes so existing replication
-// code can continue to perform LWW/read-repair without changing its API.
-func (kv *KVStore) Get(key string) (string, int64, bool) {
+// Get 返回带类型的读取结果。tombstone 通过 Deleted 表示，而不是编码进 Value；
+// 同时保留其 Timestamp，供副本间 LWW 比较。
+func (kv *KVStore) Get(key string) ReadResult {
 	kv.mu.RLock()
 	defer kv.mu.RUnlock()
 	if entry, exists := kv.memTable[key]; exists {
-		if entry.Deleted {
-			return "<TOMBSTONE>", entry.Timestamp, true
-		}
-		return entry.Value, entry.Timestamp, true
+		return ReadResult{Value: append([]byte(nil), entry.Value...), Timestamp: entry.Timestamp, Found: entry.Type == ValuePut, Deleted: entry.Type == ValueDelete}
 	}
 	record, exists := kv.index[key]
 	if !exists {
-		return "", 0, false
+		return ReadResult{}
 	}
 	entry, err := readRecordAt(record)
 	if err != nil {
-		return "", 0, false
+		return ReadResult{}
 	}
-	if entry.deleted {
-		return "<TOMBSTONE>", entry.timestamp, true
-	}
-	return entry.value, entry.timestamp, true
+	return ReadResult{Value: []byte(entry.value), Timestamp: entry.timestamp, Found: entry.type_ == ValuePut, Deleted: entry.type_ == ValueDelete}
 }
 
+// readRecordAt 按索引精确读取一条记录，无需扫描整个 SSTable。
 func readRecordAt(index IndexRecord) (diskRecord, error) {
 	file, err := os.Open(index.SSTFile)
 	if err != nil {
@@ -370,6 +408,18 @@ func readRecordAt(index IndexRecord) (diskRecord, error) {
 	return record, err
 }
 
+// entryFromIndex 只在时间戳相同、需要比较 Value 的冲突场景中，才将索引条目
+// 实体化为完整的 InternalEntry。
+func entryFromIndex(index IndexRecord) (InternalEntry, error) {
+	record, err := readRecordAt(index)
+	if err != nil {
+		return InternalEntry{}, err
+	}
+	return entryFromDisk(record), nil
+}
+
+// flush 将当前 MemTable 原子发布为新的 SSTable。发布顺序是：写入并 fsync
+// 临时文件、rename 并 fsync 目录、重置 WAL。任一步骤间崩溃都至多回放已落盘条目。
 func (kv *KVStore) flush() error {
 	if kv.memSize == 0 {
 		return nil
@@ -405,14 +455,14 @@ func (kv *KVStore) flush() error {
 	for _, key := range keys {
 		entry := kv.memTable[key]
 		size, err := writeRecord(temp, diskRecord{
-			key: key, value: entry.Value, timestamp: entry.Timestamp, deleted: entry.Deleted,
+			key: key, value: string(entry.Value), sequence: entry.Sequence, timestamp: entry.Timestamp, type_: entry.Type,
 		})
 		if err != nil {
 			return fmt.Errorf("write SSTable record: %w", err)
 		}
 		newRecords[key] = IndexRecord{
 			SSTFile: finalPath, Offset: offset, Size: size,
-			Timestamp: entry.Timestamp, Deleted: entry.Deleted,
+			Sequence: entry.Sequence, Timestamp: entry.Timestamp, Type: entry.Type,
 		}
 		offset += int64(size)
 	}
@@ -430,8 +480,8 @@ func (kv *KVStore) flush() error {
 	}
 	committed = true
 
-	// The SSTable is durable before the WAL is reset. A crash between these
-	// steps merely replays duplicates, which LWW safely ignores.
+	// SSTable 先于 WAL 重置持久化；两者之间崩溃只会回放重复条目，
+	// LWW 比较会安全地忽略它们。
 	if err := kv.resetWAL(); err != nil {
 		return err
 	}
@@ -439,12 +489,13 @@ func (kv *KVStore) flush() error {
 		kv.index[key] = record
 	}
 	kv.nextSSTID++
-	kv.memTable = make(map[string]ValueEntry)
+	kv.memTable = make(map[string]InternalEntry)
 	kv.memSize = 0
 	kv.lastFlushTime = time.Now()
 	return nil
 }
 
+// resetWAL 只能在对应的 SSTable 已经持久化后调用。
 func (kv *KVStore) resetWAL() error {
 	if err := kv.walFile.Truncate(0); err != nil {
 		return fmt.Errorf("truncate WAL: %w", err)
@@ -461,6 +512,8 @@ func (kv *KVStore) resetWAL() error {
 	return nil
 }
 
+// backgroundFlusher 定期 flush 超时的 MemTable，并在 SSTable 数量达到当前
+// 原型阈值时执行 compaction。
 func (kv *KVStore) backgroundFlusher() {
 	defer kv.flusherWG.Done()
 	ticker := time.NewTicker(time.Second)
@@ -489,6 +542,8 @@ func (kv *KVStore) backgroundFlusher() {
 	}
 }
 
+// Compact 将每个 key 的最新版本写成新 SSTable 中唯一的条目。它与写入串行执行，
+// 以保持索引和文件的一致性。
 func (kv *KVStore) Compact() error {
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
@@ -498,6 +553,8 @@ func (kv *KVStore) Compact() error {
 	return kv.compact()
 }
 
+// compact 是显式和后台 compaction 共用的、已持锁实现。它先 flush 易失数据，
+// 使后续合并只读取 SSTable。
 func (kv *KVStore) compact() error {
 	if kv.memSize > 0 {
 		if err := kv.flush(); err != nil {
@@ -555,7 +612,7 @@ func (kv *KVStore) compact() error {
 		}
 		newIndex[record.key] = IndexRecord{
 			SSTFile: finalPath, Offset: offset, Size: size,
-			Timestamp: record.timestamp, Deleted: record.deleted,
+			Sequence: record.sequence, Timestamp: record.timestamp, Type: record.type_,
 		}
 		offset += int64(size)
 	}
@@ -573,8 +630,8 @@ func (kv *KVStore) compact() error {
 	}
 	committed = true
 
-	// Publish the new in-memory view only after rename+fsync. Old files are
-	// removed afterwards, so every crash point leaves at least one full copy.
+	// 仅在 rename+fsync 后发布新的内存视图；旧文件随后才删除，
+	// 因而任意崩溃点都至少保留一份完整数据。
 	kv.index = newIndex
 	kv.nextSSTID++
 	for _, path := range oldFiles {
@@ -591,7 +648,7 @@ func (kv *KVStore) compact() error {
 	return nil
 }
 
-// Close performs a durable flush and stops the background worker.
+// Close 停止后台任务并执行一次持久化 flush。
 func (kv *KVStore) Close() error {
 	kv.stopOnce.Do(func() { close(kv.stopCh) })
 	kv.flusherWG.Wait()
@@ -611,20 +668,23 @@ func (kv *KVStore) Close() error {
 	return result
 }
 
+// writeRecord 使用固定的 25 字节大端序头部：操作类型(1)、timestamp(8)、
+// sequence(8)、key 长度(4)、value 长度(4)。
 func writeRecord(w io.Writer, record diskRecord) (int, error) {
 	keyLen, valueLen := uint64(len(record.key)), uint64(len(record.value))
 	if keyLen > maxRecordBytes || valueLen > maxRecordBytes {
 		return 0, errors.New("key or value exceeds uint32 encoding limit")
 	}
 	header := make([]byte, recordHeaderSize)
-	if record.deleted {
+	if record.type_ == ValueDelete {
 		header[0] = opDelete
 	} else {
 		header[0] = opPut
 	}
 	binary.BigEndian.PutUint64(header[1:9], uint64(record.timestamp))
-	binary.BigEndian.PutUint32(header[9:13], uint32(keyLen))
-	binary.BigEndian.PutUint32(header[13:17], uint32(valueLen))
+	binary.BigEndian.PutUint64(header[9:17], record.sequence)
+	binary.BigEndian.PutUint32(header[17:21], uint32(keyLen))
+	binary.BigEndian.PutUint32(header[21:25], uint32(valueLen))
 	if err := writeAll(w, header); err != nil {
 		return 0, err
 	}
@@ -637,6 +697,8 @@ func writeRecord(w io.Writer, record diskRecord) (int, error) {
 	return recordHeaderSize + len(record.key) + len(record.value), nil
 }
 
+// readRecord 校验已编码记录。若头部或载荷被截断则返回 io.ErrUnexpectedEOF，
+// 使 WAL 恢复只丢弃损坏尾部。
 func readRecord(r io.Reader) (diskRecord, int, error) {
 	header := make([]byte, recordHeaderSize)
 	if _, err := io.ReadFull(r, header); err != nil {
@@ -645,8 +707,8 @@ func readRecord(r io.Reader) (diskRecord, int, error) {
 	if header[0] != opPut && header[0] != opDelete {
 		return diskRecord{}, 0, fmt.Errorf("unknown operation %d", header[0])
 	}
-	keyLen := uint64(binary.BigEndian.Uint32(header[9:13]))
-	valueLen := uint64(binary.BigEndian.Uint32(header[13:17]))
+	keyLen := uint64(binary.BigEndian.Uint32(header[17:21]))
+	valueLen := uint64(binary.BigEndian.Uint32(header[21:25]))
 	total := uint64(recordHeaderSize) + keyLen + valueLen
 	if total > uint64(int(^uint(0)>>1)) {
 		return diskRecord{}, 0, errors.New("record is too large for this platform")
@@ -657,10 +719,20 @@ func readRecord(r io.Reader) (diskRecord, int, error) {
 	}
 	return diskRecord{
 		key: string(payload[:keyLen]), value: string(payload[keyLen:]),
-		timestamp: int64(binary.BigEndian.Uint64(header[1:9])), deleted: header[0] == opDelete,
+		sequence: binary.BigEndian.Uint64(header[9:17]), timestamp: int64(binary.BigEndian.Uint64(header[1:9])), type_: ValueType(header[0]),
 	}, int(total), nil
 }
 
+// entryFromDisk 和 diskFromEntry 隔离磁盘编码与带类型的内部版本模型。
+func entryFromDisk(record diskRecord) InternalEntry {
+	return InternalEntry{Key: record.key, Value: []byte(record.value), Sequence: record.sequence, Timestamp: record.timestamp, Type: record.type_}
+}
+
+func diskFromEntry(entry InternalEntry) diskRecord {
+	return diskRecord{key: entry.Key, value: string(entry.Value), sequence: entry.Sequence, timestamp: entry.Timestamp, type_: entry.Type}
+}
+
+// readFileHeader 会在解码变长记录前拒绝其他格式版本的文件。
 func readFileHeader(r io.Reader, expected [fileHeaderSize]byte) error {
 	header := make([]byte, fileHeaderSize)
 	if _, err := io.ReadFull(r, header); err != nil {
@@ -672,6 +744,7 @@ func readFileHeader(r io.Reader, expected [fileHeaderSize]byte) error {
 	return nil
 }
 
+// writeAll 处理可能分多次完成写入的 Writer。
 func writeAll(w io.Writer, data []byte) error {
 	for len(data) > 0 {
 		n, err := w.Write(data)
@@ -686,6 +759,8 @@ func writeAll(w io.Writer, data []byte) error {
 	return nil
 }
 
+// syncDir 在仅 fsync 文件不足以保证目录元数据持久化的文件系统上，
+// 让 rename 或删除操作真正落盘。
 func syncDir(path string) error {
 	dir, err := os.Open(path)
 	if err != nil {

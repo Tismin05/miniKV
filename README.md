@@ -45,13 +45,29 @@ miniKV 是一个基于 **Go** 实现的轻量级、分布式键值存储系统�
 
 ## 如何运行
 
-### 1. 编译最新的 Protobuf
-目前项目默认使用 50051 端口，如需自定义相关设置，请先基于 `api/proto/kv.proto` 重新生成 gRPC 桩代码。
+### 1. 安装依赖并运行测试
+
+需要 Go 1.24 或更高版本。首次使用时下载依赖并执行完整测试：
+
 ```bash
-protoc --go_out=. --go-grpc_out=. api/proto/kv.proto
+go mod download
+go test ./...
+go test -race ./...
+go test -bench=. ./internal/storage
 ```
 
-### 2. 启动集群节点
+测试使用临时目录和进程内 gRPC 服务，不依赖固定本地目录或手工启动的节点。
+
+### 2. 编译最新的 Protobuf
+
+如修改 `api/proto/kv.proto`，请先安装 `protoc`、`protoc-gen-go` 和 `protoc-gen-go-grpc`，再重新生成桩代码：
+
+```bash
+protoc --go_out=. --go_opt=module=miniKV \\
+  --go-grpc_out=. --go-grpc_opt=module=miniKV api/proto/kv.proto
+```
+
+### 3. 启动集群节点
 可在一个机器上通过不同端口模拟分布式多节点：
 ```bash
 # 启动节点 A
@@ -61,13 +77,13 @@ go run cmd/node/main.go -port 50051
 go run cmd/node/main.go -port 50052
 ```
 
-### 3. 启动路由网关与可视化控制台
+### 4. 启动路由网关与可视化控制台
 ```bash
 go run cmd/gateway/main.go
 ```
 启动后，网关在 `:8080` 监听。
 
-### 4. 实验与测试
+### 5. 实验与测试
 通过 CLI 进行测试：
 ```bash
 # 写入数据
